@@ -3,7 +3,7 @@
 #include "Core.h"
 #include "SPI.h"
 
-#include "PioSPI.h"
+#include "PioSpi.h"
 #include "HardwareSPI.h"
 
 SPI *SPI::getSPIDevice(SPIChannel channel)
