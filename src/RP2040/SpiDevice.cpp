@@ -21,7 +21,9 @@ void SpiDevice::SetClockFrequencyAndMode(uint32_t freq, SpiMode mode) const noex
 	hardware->configureDevice(8, (uint32_t)mode, freq);
 }
 
+#if !PICO_RP2040		// on the RP2040, RAM is reserved for the firmware-update staging buffer
 __attribute__((section(".time_critical")))
+#endif
 bool SpiDevice::TransceivePacket(const uint8_t* tx_data, uint8_t* rx_data, size_t len) noexcept
 {
 	return hardware->transceivePacket(tx_data, rx_data, len) == SPI_OK;

@@ -985,15 +985,22 @@ extern void DisableCanCore1Processing() noexcept;
 extern void EnableCanCore1Processing() noexcept;
 # endif
 
+// Optional application hooks: firmware that runs its own code on core 1 (for example when the CAN
+// chip is serviced from core 0) overrides these to park/resume it around flash operations.
+void __attribute__((weak)) ApplicationPauseCore1() noexcept { }
+void __attribute__((weak)) ApplicationResumeCore1() noexcept { }
+
 void DisableCore1Processing() noexcept
 {
 # if SUPPORT_CAN
 	DisableCanCore1Processing();
 # endif
+	ApplicationPauseCore1();
 }
 
 void EnableCore1Processing() noexcept
 {
+	ApplicationResumeCore1();
 # if SUPPORT_CAN
 	EnableCanCore1Processing();
 # endif
