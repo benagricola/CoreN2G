@@ -45,6 +45,22 @@ extern "C" void CAN_Handler() noexcept;
 extern "C" void Core1Entry() noexcept;
 
 static CanDevice devices[NumCanDevices];
+
+#if defined(RTOS) && SPICAN_CORE0_SERVICE
+// Core-0 CAN service task. Priority default: above the CAN receive task so that the RAM rings are
+// kept fed/drained ahead of the consumers; override with a build flag if a board needs otherwise.
+# ifndef SPICAN_CORE0_TASK_PRIORITY
+#  define SPICAN_CORE0_TASK_PRIORITY	4
+# endif
+constexpr size_t CanIoTaskStackWords = 400;
+static Task<CanIoTaskStackWords> canIoTask;
+static Mutex spiCanMutex;										// guards all SPI transactions to the CAN chip in core-0 service mode
+constexpr uint32_t CanIoPollIntervalMillis = 1;					// RX poll interval when there is nothing to wake us sooner
+extern "C" [[noreturn]] void CanIoTaskEntry(void *) noexcept
+{
+	devices[0].CanServiceTask();
+}
+#endif
 constexpr uint32_t AbortTimeout = 100U;
 constexpr uint32_t ChangeModeTimeout = 500U;
 
@@ -253,6 +269,14 @@ void CanDevice::DoHardwareInit() noexcept
 	txFifos[0].buffers = reinterpret_cast<volatile CanTxBuffer*>(tx0Fifo);	// address
 	txFifos[1].size = config->txFifo1Size + 1;								// number of entries
 	txFifos[1].buffers = reinterpret_cast<volatile CanTxBuffer*>(tx1Fifo);	// address
+#if SPICAN_CORE0_SERVICE
+	if (!core1Initialised)											// reused as the service-task-created flag in this mode
+	{
+		spiCanMutex.Create("SPICAN");
+		canIoTask.Create(CanIoTaskEntry, "CANIO", nullptr, SPICAN_CORE0_TASK_PRIORITY);
+		core1Initialised = true;
+	}
+#else
 	if (!core1Initialised)
 	{
 		multicore_reset_core1();
@@ -265,20 +289,21 @@ void CanDevice::DoHardwareInit() noexcept
 
 	multicore_fifo_drain();
 
-#ifdef RTOS
-#if RP2040
+# ifdef RTOS
+#  if RP2040
 	const IRQn_Type irqn = SIO_IRQ_PROC0_IRQn;
-#elif RP2350
+#  elif RP2350
 	const IRQn_Type irqn = SIO_IRQ_FIFO_IRQn;
-#else
+#  else
 #	error Invalid processor
-#endif
+#  endif
 	NVIC_DisableIRQ(irqn);
 	NVIC_ClearPendingIRQ(irqn);
 	irq_set_exclusive_handler(irqn, CAN_Handler);
 	NVIC_SetPriority(irqn, 3);
 	NVIC_EnableIRQ(irqn);
-#endif
+# endif
+#endif	// SPICAN_CORE0_SERVICE
 	// Leave the device disabled. Client must call Enable() to enable it after setting up the receive filters.
 }
 
@@ -347,10 +372,18 @@ void CanDevice::PollTxEventFifo(TxEventCallbackFunction p_txCallback) noexcept
 
 void CanDevice::ReadTimeStampCounters(uint16_t& canTimeStamp, uint32_t& stepTimeStamp) noexcept
 {
+#if SPICAN_CORE0_SERVICE
+	// Read the timestamp directly: spinning on the service task would deadlock any caller running at
+	// or above its priority
+	MutexLocker lock(spiCanMutex);
+	latestTimeStamp = 0xffffffff;
+	DoReadTimeStampCounter();
+#else
 	latestTimeStamp = 0xffffffff;
 	while (latestTimeStamp == 0xffffffff)
 	{
 	}
+#endif
 	canTimeStamp = latestTimeStamp & 0xffff;
 	stepTimeStamp = latestStepTime;
 }
@@ -469,6 +502,9 @@ uint32_t CanDevice::SendMessage(TxBufferNumber whichBuffer, uint32_t timeout, Ca
 			memcpy((void *)(fifo.buffers[bufferIndex].data), buffer->msg.raw, dlcLen);
 			fifo.putIndex = nextTxFifoPutIndex;
 			stats.messagesQueuedForSending++;
+#if defined(RTOS) && SPICAN_CORE0_SERVICE
+			canIoTask.Give(NotifyIndices::CanDevice);			// wake the service task so the frame goes out promptly
+#endif
 		}
 		return cancelledId;
 	}
@@ -732,6 +768,7 @@ void CanDevice::GetAndClearStats(CanDevice::CanStats& dst) noexcept
 
 #ifdef RTOS
 
+#if !SPICAN_CORE0_SERVICE
 void CanDevice::Interrupt() noexcept
 {
 	while ((sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS) != 0)
@@ -767,6 +804,34 @@ void CAN_Handler() noexcept
 {
 	devices[0].Interrupt();
 }
+#endif	// !SPICAN_CORE0_SERVICE
+
+#if SPICAN_CORE0_SERVICE
+// Wake any tasks waiting on ring-buffer events. Task context, not ISR.
+void CanDevice::NotifyWaiters(uint32_t ir) noexcept
+{
+	if (ir & rxFifo0NotEmpty)
+	{
+		TaskBase * const t0 = rxFifos[0].waitingTask;
+		if (t0 != nullptr) { t0->Give(NotifyIndices::CanDevice); }
+	}
+	if (ir & rxFifo1NotEmpty)
+	{
+		TaskBase * const t1 = rxFifos[1].waitingTask;
+		if (t1 != nullptr) { t1->Give(NotifyIndices::CanDevice); }
+	}
+	if (ir & txFifo0NotFull)
+	{
+		TaskBase * const t2 = txFifos[0].waitingTask;
+		if (t2 != nullptr) { t2->Give(NotifyIndices::CanDevice); }
+	}
+	if (ir & txFifo1NotFull)
+	{
+		TaskBase * const t3 = txFifos[1].waitingTask;
+		if (t3 != nullptr) { t3->Give(NotifyIndices::CanDevice); }
+	}
+}
+#endif	// SPICAN_CORE0_SERVICE
 
 #endif	// RTOS
 
@@ -926,6 +991,78 @@ void CanDevice::DoReadTimeStampCounter() noexcept
 }
 
 
+#if SPICAN_CORE0_SERVICE
+
+// Core-0 service task loop: the same frame-shuttling logic as the core-1 CanIO loop, but sleeping
+// between passes and woken early by TX submissions. core1Idle doubles as the "not touching the SPI"
+// indicator that PauseCore1 waits on, so it is set while we are blocked and cleared during a pass.
+[[noreturn]] void CanDevice::CanServiceTask() noexcept
+{
+	debugPrintf("CAN service task running on core 0\n");
+	for (;;)
+	{
+		core1Idle = true;
+		(void)TaskBase::TakeIndexed(NotifyIndices::CanDevice, CanIoPollIntervalMillis);
+		if (runState == RunState::enabled && !core1Paused)
+		{
+			core1Idle = false;
+			uint32_t pendingInterrupts = 0;
+			MutexLocker lock(spiCanMutex);
+			// Check for incoming data
+			for (size_t rx = 0; rx < NumCanRxFifos; rx++)
+			{
+				RxFifo& fifo = rxFifos[rx];
+				const uint32_t putIndex = fifo.putIndex;
+				uint32_t nextPutIndex = putIndex + 1;
+				if (nextPutIndex == fifo.size)
+				{
+					nextPutIndex = 0;
+				}
+				if (nextPutIndex != fifo.getIndex && DoReceiveMessage((RxBufferNumber)(rx + (uint32_t)RxBufferNumber::fifo0), &fifo.buffers[putIndex]))
+				{
+					fifo.putIndex = nextPutIndex;
+					pendingInterrupts |= (1 << rx);
+				}
+			}
+			for (size_t tx = 0; tx < NumCanTxFifos; tx++)
+			{
+				if (abortTx[tx])
+				{
+					DoAbortMessage((TxBufferNumber)(tx + (uint32_t)TxBufferNumber::fifo));
+					abortTx[tx] = false;
+				}
+				{
+					TxFifo& fifo = txFifos[tx];
+					uint32_t getIndex = fifo.getIndex;
+					if (getIndex != fifo.putIndex && DoSendMessage((TxBufferNumber)(tx + (uint32_t)TxBufferNumber::fifo), &fifo.buffers[getIndex]))
+					{
+						getIndex = getIndex + 1;
+						if (getIndex == fifo.size)
+						{
+							getIndex = 0;
+						}
+						fifo.getIndex = getIndex;
+						if (fifo.NotFullInterruptEnabled)
+						{
+							pendingInterrupts |= txFifo0NotFull >> tx;
+						}
+					}
+				}
+			}
+			if (latestTimeStamp == 0xffffffff)
+			{
+				DoReadTimeStampCounter();
+			}
+			if (pendingInterrupts != 0)
+			{
+				NotifyWaiters(pendingInterrupts);
+			}
+		}
+	}
+}
+
+#else	// !SPICAN_CORE0_SERVICE
+
 [[noreturn]] void CRITICAL_MEMBER(CanDevice, CanIO)() noexcept
 {
 	debugPrintf("CanIO core 1 running....\n");
@@ -1001,6 +1138,8 @@ extern "C" [[noreturn]]void Core1Entry() noexcept
 {
 	devices[0].CanIO();
 }
+
+#endif	// !SPICAN_CORE0_SERVICE
 
 // Park core 1 in its RAM-resident idle loop without touching the CAN chip (see header comment).
 // Returns true if core 1 acknowledged the park, false if we timed out waiting (we proceed anyway,

@@ -9,6 +9,14 @@
 #ifndef SRC_SPICANRP2040_H_
 #define SRC_SPICANRP2040_H_
 
+// SPICAN_CORE0_SERVICE: when nonzero, the CAN chip is serviced by a high-priority task on core 0
+// instead of a dedicated busy-poll loop on core 1, leaving core 1 free for other work.
+// RX is polled at 1ms granularity (the same granularity as the STM32 SpiCanDevice); TX submissions
+// wake the task immediately.
+#ifndef SPICAN_CORE0_SERVICE
+# define SPICAN_CORE0_SERVICE	0
+#endif
+
 #include <CoreIO.h>
 
 #if SUPPORT_CAN && USE_SPICAN 
@@ -76,6 +84,10 @@ struct TxFifo
 
 	void Clear() noexcept { getIndex = 0; putIndex = 0; }
 };
+
+#if SPICAN_CORE0_SERVICE
+extern "C" [[noreturn]] void CanIoTaskEntry(void *) noexcept;
+#endif
 
 class CanDevice
 {
@@ -277,6 +289,10 @@ private:
 	bool ChangeMode(CAN_OPERATION_MODE newMode) noexcept;
 	void CheckBusStatus() noexcept;
 	[[noreturn]] void CanIO() noexcept;
+#if SPICAN_CORE0_SERVICE
+	[[noreturn]] void CanServiceTask() noexcept;			// the core-0 replacement for the core-1 CanIO loop
+	void NotifyWaiters(uint32_t bits) noexcept;				// wake tasks waiting on ring buffer events (task context)
+#endif
 	bool DoSendMessage(TxBufferNumber whichBuffer, volatile CanTxBuffer *buffer) noexcept;
 	bool DoReceiveMessage(RxBufferNumber whichBuffer, volatile CanRxBuffer *buffer) noexcept;
 	bool DoAbortMessage(TxBufferNumber whichBuffer) noexcept;
@@ -317,6 +333,9 @@ private:
 	volatile bool abortTx[NumCanTxFifos];
 
 	friend void Core1Entry() noexcept;
+#if SPICAN_CORE0_SERVICE
+	friend void CanIoTaskEntry(void *) noexcept;
+#endif
 
 };
 
