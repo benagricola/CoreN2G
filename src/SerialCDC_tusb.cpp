@@ -28,6 +28,11 @@ extern "C" {
 # include <CoreNotifyIndices.h>
 #endif
 
+#if RPXXXX && MNB_USB_DIAG
+# include <pico/bootrom.h>			// rom_reset_usb_boot (enter BOOTSEL)
+# include <hardware/watchdog.h>		// watchdog_reboot (warm reboot)
+#endif
+
 // Array of SerialCDC instances for lookup by interface index in callbacks
 static SerialCDC *serialCDCInstances[CFG_TUD_CDC] = { nullptr };
 
@@ -290,6 +295,28 @@ extern "C" void tud_cdc_rx_cb(uint8_t itf) noexcept
 {
 	(void) itf;
 }
+
+#if RPXXXX && MNB_USB_DIAG
+// Bench-only autonomous board control over USB, gated by MNB_USB_DIAG so it is never present on
+// production or other boards. The host selects a magic baud rate to reset the board with no physical
+// access. This callback runs in the USB device task (CoreUsbDeviceTask), so it works whenever that
+// task gets CPU: it does NOT fire while a higher-priority task busy-spins (e.g. a core-1 relaunch
+// hang starves the USB task) — recovery from a genuine wedge needs the watchdog, not this path:
+//   1200 baud -> reboot into BOOTSEL mass-storage, so a UF2 can be dropped on to (re)flash / recover
+//   1201 baud -> warm (watchdog) reboot, to exercise the warm-reset / core-1 relaunch path quickly
+extern "C" void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_line_coding) noexcept
+{
+	(void)itf;
+	if (p_line_coding->bit_rate == 1200)
+	{
+		rom_reset_usb_boot(0, 0);					// enter BOOTSEL; does not return
+	}
+	else if (p_line_coding->bit_rate == 1201)
+	{
+		watchdog_reboot(0, 0, 0);					// warm reboot; does not return
+	}
+}
+#endif
 
 #ifdef RTOS
 
