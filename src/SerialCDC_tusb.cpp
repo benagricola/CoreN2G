@@ -313,15 +313,19 @@ extern "C" void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_l
 	(void)itf;
 	if (p_line_coding->bit_rate == 1200)
 	{
-		// Observed on the bench: calling the bootrom reboot with core 1 running bare-metal code never
-		// completes (the USB task wedged in it until the stuck-in-spin check reset the board), and
-		// with the ~1s watchdog armed, BOOTSEL mode would be reset back into the app before the
-		// mass-storage device could enumerate. So: hard power-off core 1 (bounded register writes
-		// only — the SDK's multicore_reset_core1() waits unboundedly and has also hung here), leave
-		// it off (the chip reset on BOOTSEL entry brings it back), and disarm the watchdog first.
+		// The bootrom implements the BOOTSEL reboot as a short delayed reset on the WATCHDOG hardware.
+		// With interrupts enabled, the 1ms tick hook keeps writing the watchdog LOAD register, which
+		// restarts the ROM's countdown every millisecond so the reboot never fires: the USB task then
+		// wedges in the ROM call and BOOTSEL only happens ~60s later, when the stuck-in-spin software
+		// reset finally consumes the still-pending BOOTSEL directive. So: hard power-off core 1
+		// (bounded register writes only — the SDK's multicore_reset_core1() waits unboundedly and has
+		// hung here), then DISABLE INTERRUPTS to silence the tick hook, disarm the watchdog, and let
+		// the ROM's delayed reboot fire cleanly. (The same fix was proven on the 3.6 branch's 'B'
+		// command; nothing after this returns.)
 		hw_set_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
 		while ((psm_hw->frce_off & PSM_FRCE_OFF_PROC1_BITS) == 0) { }
-		watchdog_disable();							// nothing kicks the watchdog in BOOTSEL mode
+		__disable_irq();							// stop the tick hook restarting the ROM's watchdog-based reboot countdown
+		watchdog_disable();
 		rom_reset_usb_boot(0, 0);					// enter BOOTSEL; does not return
 	}
 	else if (p_line_coding->bit_rate == 1201)
