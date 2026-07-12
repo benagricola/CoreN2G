@@ -30,7 +30,9 @@ extern "C" {
 
 #if RPXXXX && MNB_USB_DIAG
 # include <pico/bootrom.h>			// rom_reset_usb_boot (enter BOOTSEL)
-# include <hardware/watchdog.h>		// watchdog_reboot (warm reboot)
+# include <hardware/watchdog.h>		// watchdog_reboot (warm reboot), watchdog_disable
+# include <hardware/structs/watchdog.h>
+# include <hardware/structs/psm.h>	// hard power-off of core 1 before entering BOOTSEL
 #endif
 
 // Array of SerialCDC instances for lookup by interface index in callbacks
@@ -304,16 +306,32 @@ extern "C" void tud_cdc_rx_cb(uint8_t itf) noexcept
 // hang starves the USB task) — recovery from a genuine wedge needs the watchdog, not this path:
 //   1200 baud -> reboot into BOOTSEL mass-storage, so a UF2 can be dropped on to (re)flash / recover
 //   1201 baud -> warm (watchdog) reboot, to exercise the warm-reset / core-1 relaunch path quickly
+//   1202 baud -> arm the core-1 launch-hang self-test and warm-reboot: the next boot fakes a hang in
+//                the core-1 launch window, which the gated-watchdog escape must recover from
 extern "C" void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_line_coding) noexcept
 {
 	(void)itf;
 	if (p_line_coding->bit_rate == 1200)
 	{
+		// Observed on the bench: calling the bootrom reboot with core 1 running bare-metal code never
+		// completes (the USB task wedged in it until the stuck-in-spin check reset the board), and
+		// with the ~1s watchdog armed, BOOTSEL mode would be reset back into the app before the
+		// mass-storage device could enumerate. So: hard power-off core 1 (bounded register writes
+		// only — the SDK's multicore_reset_core1() waits unboundedly and has also hung here), leave
+		// it off (the chip reset on BOOTSEL entry brings it back), and disarm the watchdog first.
+		hw_set_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+		while ((psm_hw->frce_off & PSM_FRCE_OFF_PROC1_BITS) == 0) { }
+		watchdog_disable();							// nothing kicks the watchdog in BOOTSEL mode
 		rom_reset_usb_boot(0, 0);					// enter BOOTSEL; does not return
 	}
 	else if (p_line_coding->bit_rate == 1201)
 	{
 		watchdog_reboot(0, 0, 0);					// warm reboot; does not return
+	}
+	else if (p_line_coding->bit_rate == 1202)
+	{
+		watchdog_hw->scratch[2] = 0x7E57CAFE;		// consumed by the core-1 launch code on the next boot (see Core1Runtime.cpp)
+		watchdog_reboot(0, 0, 0);					// warm reboot into the self-test; does not return
 	}
 }
 #endif
