@@ -30,6 +30,13 @@ public:
 
 	bool Select(uint32_t timeout = Mutex::TimeoutUnlimited) const noexcept;					// get SPI ownership and select the device, return true if successful
 	void Deselect() const noexcept;
+
+	// Configure and assert/release the device WITHOUT taking or releasing the bus mutex. For callers that
+	// cannot take a FreeRTOS mutex (e.g. a bare-metal second core) and that guarantee exclusion by other
+	// means. The hardware configuration (clock, mode, peripheral enable) is still performed, so a transfer
+	// between these calls behaves exactly as one between Select() and Deselect().
+	void SelectNoMutex() const noexcept;
+	void DeselectNoMutex() const noexcept;
 	bool TransceivePacket(const uint8_t *_ecv_array _ecv_null tx_data, uint8_t *_ecv_array _ecv_null rx_data, size_t len) const noexcept;
 	bool ReadPacket(uint8_t *_ecv_array rx_data, size_t len) const noexcept { return TransceivePacket(nullptr, rx_data, len); }
 	bool WritePacket(const uint8_t *_ecv_array tx_data, size_t len) const noexcept { return TransceivePacket(tx_data, nullptr, len); }

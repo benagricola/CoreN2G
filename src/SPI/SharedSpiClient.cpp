@@ -40,6 +40,26 @@ bool SharedSpiClient::Select(uint32_t timeout) const noexcept
 	return ok;
 }
 
+// Configure and assert CS without taking the bus mutex (see header)
+void SharedSpiClient::SelectNoMutex() const noexcept
+{
+	device.SetClockFrequencyAndMode(clockFrequency, mode
+#if SAME5x
+									, false
+#endif
+								   );							// this also enables the SPI peripheral
+	delayMicroseconds(1);										// allow the clock time to settle
+	digitalWrite(csPin, csActivePolarity);
+}
+
+// Release CS and disable the peripheral without releasing the bus mutex (see header)
+void SharedSpiClient::DeselectNoMutex() const noexcept
+{
+	digitalWrite(csPin, !csActivePolarity);
+	delayMicroseconds(1);										// in case the clock makes an abrupt transition when we disable SPI
+	device.Disable();
+}
+
 // Release CS and release ownership of the SPI bus
 void SharedSpiClient::Deselect() const noexcept
 {
