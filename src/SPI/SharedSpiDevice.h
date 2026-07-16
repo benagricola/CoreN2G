@@ -24,6 +24,9 @@ public:
 
 private:
 	Mutex mutex;
+#if STM32 || RPXXXX
+	char mutexName[8];							// Mutex::Create keeps the name pointer, so the storage must live as long as the mutex
+#endif
 };
 
 #endif /* SRC_HARDWARE_SPI_SHAREDSPIDEVICE_H_ */

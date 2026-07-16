@@ -7,14 +7,17 @@
 
 #include "SharedSpiDevice.h"
 
+#include <General/SafeVsnprintf.h>
+
 // SharedSpiDevice members
 
 SharedSpiDevice::SharedSpiDevice(const SpiParameters& params) noexcept : SpiDevice(params)
 {
 #if STM32 || RPXXXX
-	static char name[] = "SPI0";
-	name[3] = '0' + params.instanceNumber;
-	mutex.Create(name);
+	// Mutex::Create keeps the name pointer rather than copying the string, so format the name into
+	// a buffer that lives as long as this instance
+	SafeSnprintf(mutexName, sizeof(mutexName), "SPI%u", (unsigned int)params.instanceNumber);
+	mutex.Create(mutexName);
 #else
 	mutex.Create("SPI");
 #endif
