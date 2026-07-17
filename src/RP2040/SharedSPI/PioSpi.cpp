@@ -213,6 +213,12 @@ PioSPI::PioSPI() noexcept
 
 spi_status_t PioSPI::transceivePacket(const uint8_t *tx_data, uint8_t *rx_data, size_t len, Pin cs) noexcept
 {
+    if (curClockMode == 0xffffffff)
+    {
+        // No client has ever selected this bus, so configureDevice has not run and the state machine
+        // is not enabled. The blocking FIFO loops have no timeout, so a transfer would spin forever.
+        return SPI_ERROR;
+    }
     spi_status_t ret = SPI_OK;
     if (cs != NoPin) fastDigitalWriteLow(cs);
 	const int bytesTransferred = (rx_data == nullptr) ? pio_spi_write_blocking(&dev, tx_data, len)
